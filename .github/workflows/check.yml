@@ -1,0 +1,215 @@
+# FirstCry restock bot: runs on GitHub's free servers and alerts your phone via ntfy.
+name: FirstCry restock check
+
+on:
+  schedule:
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "ping = test phone alert, test = show what the bot sees, once = normal check"
+        type: choice
+        options: [once, ping, test]
+        default: once
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install browser
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Run bot
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MODE: ${{ github.event.inputs.mode || 'once' }}
+        run: |
+          cat > bot.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          FirstCry restock alert -> push notification on your phone (via ntfy).
+
+          FirstCry fills in stock status with JavaScript, so this opens the product page
+          in a headless browser (Playwright), reads what a visitor sees, and alerts you
+          when the item becomes buyable.
+
+            --ping        send a test notification
+            --test [URL]  check once, show what the bot sees, send the result to your phone
+            --once        check once, then exit (what the GitHub schedule runs)
+            (no flag)     check every ~5 minutes, forever (for a PC)
+
+          Needs the NTFY_TOPIC environment variable (or edit NTFY_TOPIC below).
+          """
+          import argparse
+          import os
+          import random
+          import sys
+          import time
+          import urllib.request
+
+          NTFY_TOPIC = (os.environ.get("NTFY_TOPIC") or "CHANGE-ME-long-random-name").strip()
+          CHECK_EVERY_SECONDS = 300    # PC mode only: be polite, don't go below ~3 minutes
+          REMIND_EVERY_SECONDS = 900   # PC mode only: repeat the alert while in stock
+
+          PRODUCTS = {
+              "Team Transport #97 Porsche 911 GT3 R (Rexy)":
+                  "https://www.firstcry.com/hot-wheels/hot-wheels-car-culture-team-transport-97-porsche-911-gt3-r992-with-fleet-flyer-transport-truck-in-light-green/24854850/product-detail",
+              # Add more variants the same way:
+              # "Name": "https://www.firstcry.com/.../product-detail",
+          }
+
+          OUT_WORDS = ["out of stock", "sold out", "currently unavailable"]
+          IN_WORDS = ["add to cart", "buy now"]
+          BLOCK_WORDS = ["access denied", "captcha", "unusual traffic", "are you a robot"]
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+          def classify(text):
+              """Return IN, OUT, UNKNOWN or BLOCKED from the page's visible text.
+
+              The main product block sits above the 'similar products' rows, so
+              whichever marker shows up first on the page decides.
+              """
+              t = " ".join(text.lower().split())
+              if len(t) < 200 or any(w in t for w in BLOCK_WORDS):
+                  return "BLOCKED"
+              first = lambda words: min((t.find(w) for w in words if w in t), default=None)
+              i, o = first(IN_WORDS), first(OUT_WORDS)
+              if i is None and o is None:
+                  return "UNKNOWN"
+              if o is None or (i is not None and i < o):
+                  return "IN"
+              return "OUT"
+
+
+          def fetch_text(url, screenshot=None):
+              """Open the page in a real browser and return the text a visitor sees."""
+              from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  try:
+                      ctx = browser.new_context(user_agent=UA, locale="en-IN",
+                                                timezone_id="Asia/Kolkata",
+                                                viewport={"width": 1366, "height": 900})
+                      page = ctx.new_page()
+                      page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                      try:
+                          page.wait_for_load_state("networkidle", timeout=20000)
+                      except PWTimeout:
+                          pass
+                      page.wait_for_timeout(3000)  # let the stock widgets paint
+                      if screenshot:
+                          page.screenshot(path=screenshot)
+                      return page.inner_text("body")
+                  finally:
+                      browser.close()
+
+
+          def notify(title, message, url=None, tags="bell", urgent=False):
+              headers = {"Title": title, "Tags": tags,
+                         "Priority": "urgent" if urgent else "default"}
+              if url:
+                  headers["Click"] = url  # tapping the alert opens the product page
+              req = urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}",
+                                           data=message.encode("utf-8"),
+                                           headers=headers, method="POST")
+              urllib.request.urlopen(req, timeout=15).close()
+
+
+          def handle(name, url, status, st):
+              """Decide whether to alert. st holds this product's state between checks."""
+              now = time.time()
+              print(f"[{time.strftime('%H:%M:%S')}] {name}: {status}", flush=True)
+              if status == "IN":
+                  if st["last"] != "IN" or now - st["alerted"] > REMIND_EVERY_SECONDS:
+                      notify("BACK IN STOCK!", f"{name} is buyable on FirstCry. Tap to open.",
+                             url, tags="rotating_light,racing_car", urgent=True)
+                      st["alerted"] = now
+                  st["bad"] = 0
+              elif status in ("BLOCKED", "ERROR"):
+                  st["bad"] += 1
+                  if st["bad"] == 3:  # tell me once if the bot is stuck
+                      notify("Bot can't read FirstCry",
+                             f"{name}: page not loading ({status}). Check the script.",
+                             tags="warning")
+              else:
+                  st["bad"] = 0
+              st["last"] = status
+
+
+          def show(text):
+              """Print the evidence behind a status (used by --test)."""
+              t = " ".join(text.lower().split())
+              print(f"  visible text length: {len(t)}")
+              for w in OUT_WORDS + IN_WORDS:
+                  k = t.find(w)
+                  if k >= 0:
+                      snippet = t[max(0, k - 60):k + 60].encode("ascii", "replace").decode()
+                      print(f"  '{w}' first seen at {k}: ...{snippet}...")
+
+
+          def run_test(targets):
+              lines = []
+              for name, url in targets.items():
+                  try:
+                      text = fetch_text(url, screenshot="debug.png")
+                      status = classify(text)
+                      print(f"{name}: {status}")
+                      show(text)
+                  except Exception as e:
+                      status = f"ERROR ({e})"
+                      print(f"{name}: {status}")
+                  lines.append(f"{name}: {status}")
+              if not NTFY_TOPIC.startswith("CHANGE-ME"):
+                  notify("Bot test result",
+                         "\n".join(lines) + "\n\nOUT is right while it is sold out. "
+                         "IN is right when it is buyable.")
+
+
+          def main():
+              ap = argparse.ArgumentParser(description="FirstCry restock alert")
+              ap.add_argument("--ping", action="store_true", help="send a test notification")
+              ap.add_argument("--test", nargs="?", const="", metavar="URL",
+                              help="check once and show details, no alerts (optional URL)")
+              ap.add_argument("--once", action="store_true", help="check once, then exit")
+              args = ap.parse_args()
+
+              if args.test is not None:
+                  run_test({"that link": args.test} if args.test else PRODUCTS)
+                  return
+
+              if NTFY_TOPIC.startswith("CHANGE-ME"):
+                  sys.exit("Set NTFY_TOPIC first (see the top of this file).")
+
+              if args.ping:
+                  notify("Test from your Hot Wheels bot", "If you can read this, alerts work!")
+                  print("Test alert sent.")
+                  return
+
+              state = {n: {"last": None, "alerted": 0, "bad": 0} for n in PRODUCTS}
+              while True:
+                  for name, url in PRODUCTS.items():
+                      try:
+                          status = classify(fetch_text(url))
+                      except Exception as e:  # network hiccup, browser crash, etc.
+                          print(f"  error: {e}", flush=True)
+                          status = "ERROR"
+                      try:
+                          handle(name, url, status, state[name])
+                      except Exception as e:  # e.g. ntfy unreachable: keep going
+                          print(f"  could not send alert: {e}", flush=True)
+                  if args.once:
+                      break
+                  time.sleep(CHECK_EVERY_SECONDS + random.randint(-30, 30))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python bot.py --"$MODE"
